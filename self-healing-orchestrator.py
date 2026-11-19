@@ -1,8 +1,6 @@
-import ast
+import asyncio
 import os
-import re
 import sys
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -10,12 +8,31 @@ from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 from fastmcp import FastMCP
 
-# Switch between your preferred cloud model:
 from langchain_openai import ChatOpenAI
 # from langchain_anthropic import ChatAnthropic
 # from langchain_google_genai import ChatGoogleGenerativeAI
+# from langchain_ollama import ChatOllama
 
 from langgraph.graph import StateGraph, START, END
+
+try:
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+except ImportError:
+    AsyncSqliteSaver = None
+
+from orchestrator_core import (
+    ArtifactFile,
+    extract_and_write_files,
+    get_existing_tests,
+    get_source_snapshot,
+    get_sqlite_checkpointer,
+    get_workspace_lock,
+    git_worktree_sandbox,
+    log_audit_event,
+    run_sandboxed_tests,
+    validate_python_ast,
+    get_llm
+)
 
 # =====================================================================
 # 1. INITIALIZE FASTMCP SERVER & MODEL
@@ -23,13 +40,14 @@ from langgraph.graph import StateGraph, START, END
 
 mcp = FastMCP("SDLC-Observability-SelfHealing-Orchestrator")
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+llm = get_llm()
+#llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
 # llm = ChatAnthropic(model="claude-3-5-sonnet-latest", temperature=0.0)
-# llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.0)
+# llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0.0, num_ctx=4096)
 
 
 # =====================================================================
-# 2. STRUCTURED SCHEMAS
+# 2. STRUCTURED SCHEMAS & STATE
 # =====================================================================
 
 class IncidentDiagnosis(BaseModel):
@@ -40,9 +58,6 @@ class IncidentDiagnosis(BaseModel):
     reproduction_steps: str = Field(description="Exact inputs/state required to reproduce the bug in a unit test")
     fix_strategy: str = Field(description="Code-level remediation plan")
 
-class CodeArtifact(BaseModel):
-    file_path: str = Field(description="Relative file path e.g., src/api/routes.py or tests/regression/test_inc_01.py")
-    content: str = Field(description="Complete, valid file content")
 
 class SelfHealingState(TypedDict):
     workspace_path: str
@@ -50,74 +65,23 @@ class SelfHealingState(TypedDict):
     test_runner_command: str
     codebase_snapshot: str
     arch_text: str
-    
+
     diagnosis: Optional[IncidentDiagnosis]
-    written_artifacts: List[CodeArtifact]
+    written_artifacts: List[ArtifactFile]
     pr_summary: str
-    
+
     last_test_stdout: str
     last_test_stderr: str
     last_test_exit_code: int
-    
     iteration_count: int
 
 
 # =====================================================================
-# 3. HELPER FUNCTIONS
-# =====================================================================
-
-def extract_and_write_artifacts(workspace: Path, llm_text: str) -> List[CodeArtifact]:
-    """Parses ```lang blocks preceded by 'FILE: path/to/file' and writes clean multi-line files."""
-    pattern = r"FILE:\s*([^\n`]+)\s*\n```[a-zA-Z0-9_-]*\n(.*?)```"
-    matches = re.findall(pattern, llm_text, flags=re.DOTALL)
-    written: List[CodeArtifact] = []
-
-    for rel_path, code in matches:
-        clean_path = rel_path.strip().strip("`*")
-        target = workspace / clean_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        clean_code = code.strip() + "\n"
-        target.write_text(clean_code, encoding="utf-8")
-        sys.stderr.write(f"Wrote file: {clean_path}\n")
-        written.append(CodeArtifact(file_path=clean_path, content=clean_code))
-
-    if not written:
-        sys.stderr.write("Warning: No 'FILE: <path>' code blocks matched in LLM response.\n")
-    return written
-
-def read_codebase(workspace: Path) -> str:
-    ignore_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules", "docs", ".pytest_cache"}
-    allowed_exts = {".py", ".ts", ".js", ".go", ".sql", ".yml", ".yaml"}
-    chunks = []
-    for path in sorted(workspace.rglob("*")):
-        if any(part in ignore_dirs for part in path.parts):
-            continue
-        if path.is_file() and path.suffix in allowed_exts and "test" not in path.parts:
-            rel = path.relative_to(workspace).as_posix()
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            chunks.append(f"### FILE: {rel}\n{text[:3000]}")
-    return "\n\n".join(chunks)[:12000]
-
-def get_existing_tests(workspace: Path) -> str:
-    """Collects existing unit and integration tests so hotfixes preserve backward compatibility."""
-    tests_dir = workspace / "tests"
-    if not tests_dir.exists():
-        return ""
-    chunks = []
-    for path in sorted(tests_dir.rglob("test_*.py")):
-        if "regression" not in path.parts:
-            rel = path.relative_to(workspace).as_posix()
-            chunks.append(f"### {rel}\n{path.read_text(encoding='utf-8', errors='ignore')[:1500]}")
-    return "\n\n".join(chunks)[:3500]
-
-
-# =====================================================================
-# 4. AGENT NODES
+# 3. AGENT NODES
 # =====================================================================
 
 def sre_triage_agent(state: SelfHealingState):
     sys.stderr.write("\n[Phase 6 -> Agent 1] SRE Triage Agent analyzing runtime telemetry & stack trace...\n")
-    
     prompt = f"""
     You are a Principal Site Reliability Engineer (SRE) responding to a production incident.
     Correlate the runtime error logs / telemetry alert below with the application source code.
@@ -134,12 +98,11 @@ def sre_triage_agent(state: SelfHealingState):
     Tasks:
     1. Classify incident severity ('SEV-1', 'SEV-2', or 'SEV-3').
     2. Identify the exact source file(s) and function(s) responsible.
-    3. Determine the root cause (e.g., unhandled null/None, race condition, timeout, schema mismatch, memory leak).
+    3. Determine the root cause.
     4. Define exact reproduction inputs so an engineer can write a failing regression test.
     """
-    
     diagnosis = llm.with_structured_output(IncidentDiagnosis).invoke(prompt)
-    sys.stderr.write(f"Incident Triaged: [{diagnosis.severity}] {diagnosis.incident_title}\n")
+    sys.stderr.write(f"[Phase 6] Triaged: [{diagnosis.severity}] {diagnosis.incident_title}\n")
     return {"diagnosis": diagnosis}
 
 
@@ -148,7 +111,7 @@ def hotfix_and_regression_engineer(state: SelfHealingState):
     diag = state["diagnosis"]
     workspace = Path(state["workspace_path"])
     existing_tests_ctx = get_existing_tests(workspace)
-    
+
     retry_context = ""
     if state.get("iteration_count", 0) > 0 and state.get("last_test_exit_code", 0) != 0:
         last_written = "\n\n".join(f"### {f.file_path}\n{f.content}" for f in state.get("written_artifacts", []))
@@ -183,7 +146,7 @@ def hotfix_and_regression_engineer(state: SelfHealingState):
     1. `tests/regression/test_incident_regression.py`: Automated pytest regression test reproducing the crash 
        condition and asserting the fixed behavior. Import modules directly from `src/`.
        Assert exception types (e.g., `pytest.raises(TypeError)` for `None`/invalid types and `pytest.raises(ValueError)` 
-       for out-of-range values like `-5`) rather than brittle exact exception message strings.
+       for out-of-range values) rather than brittle exact exception message strings.
     2. Patched source file(s) under `src/` that fix the crash while preserving backward compatibility 
        with all existing tests above:
        - Keep type checks (`TypeError` for `None`/bool/non-numeric) and range checks (`ValueError` for `<= 0`) separate.
@@ -202,72 +165,45 @@ def hotfix_and_regression_engineer(state: SelfHealingState):
     # complete multi-line patched source code here
     {fence}
     """
-    
     response = llm.invoke(prompt)
-    written = extract_and_write_artifacts(workspace, response.content)
-    updated_snapshot = read_codebase(workspace)
-    
+    written = extract_and_write_files(workspace, response.content)
     return {
         "written_artifacts": written,
-        "codebase_snapshot": updated_snapshot,
-        "pr_summary": f"Hotfix [{diag.severity}]: {diag.incident_title} - {diag.fix_strategy}"
+        "codebase_snapshot": get_source_snapshot(workspace),
+        "pr_summary": f"Hotfix [{diag.severity}]: {diag.incident_title} - {diag.fix_strategy}",
     }
 
 
 def regression_verification_runner(state: SelfHealingState):
-    cmd = state.get("test_runner_command") or "pytest -v"
-    if "pytest" in cmd and "--maxfail" not in cmd:
-        cmd = f"{cmd} --maxfail=1"
-    sys.stderr.write(f"\n[Phase 6 -> Runner] Executing full regression & unit test suite: `{cmd}`...\n")
-    
     workspace = Path(state["workspace_path"])
     new_iter = state.get("iteration_count", 0) + 1
+    sys.stderr.write(f"\n[Phase 6 -> Runner] Executing verification Pass #{new_iter}...\n")
 
-    # Fast AST syntax validation before invoking pytest
-    for f in state.get("written_artifacts", []):
-        if f.file_path.endswith(".py"):
-            try:
-                ast.parse(f.content)
-            except SyntaxError as e:
-                err_msg = f"SyntaxError in {f.file_path} at line {e.lineno}: {e.msg}"
-                sys.stderr.write(f"{err_msg}\n")
-                return {
-                    "last_test_stdout": "",
-                    "last_test_stderr": err_msg,
-                    "last_test_exit_code": 2,
-                    "iteration_count": new_iter
-                }
+    syntax_err = validate_python_ast(state.get("written_artifacts", []))
+    if syntax_err:
+        sys.stderr.write(f"[Phase 6 -> AST Gate] {syntax_err}\n")
+        return {
+            "last_test_stdout": "",
+            "last_test_stderr": syntax_err,
+            "last_test_exit_code": 2,
+            "iteration_count": new_iter,
+        }
 
-    env = os.environ.copy()
-    env["PYTHONPATH"] = f"{workspace.resolve()}{os.pathsep}{(workspace / 'src').resolve()}"
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=workspace,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        stdout, stderr, code = proc.stdout, proc.stderr, proc.returncode
-    except Exception as e:
-        stdout, stderr, code = "", str(e), 1
-
-    sys.stderr.write(f"Verification Pass #{new_iter} Exit Code: {code}\n")
+    cmd = state.get("test_runner_command") or None
+    result = run_sandboxed_tests(workspace, command=cmd, timeout_seconds=45)
+    sys.stderr.write(f"[Phase 6 -> Runner] Pass #{new_iter} Exit Code: {result.exit_code}\n")
     return {
-        "last_test_stdout": stdout,
-        "last_test_stderr": stderr,
-        "last_test_exit_code": code,
-        "iteration_count": new_iter
+        "last_test_stdout": result.stdout,
+        "last_test_stderr": result.stderr,
+        "last_test_exit_code": result.exit_code,
+        "iteration_count": new_iter,
     }
 
 
 def observability_and_postmortem_agent(state: SelfHealingState):
     sys.stderr.write("\n[Phase 6 -> Agent 3] Hardening observability alerts & generating Post-Mortem...\n")
     diag = state["diagnosis"]
+    workspace = Path(state["workspace_path"])
     passed = state.get("last_test_exit_code", 1) == 0
     fence = "`" * 3
 
@@ -285,8 +221,7 @@ def observability_and_postmortem_agent(state: SelfHealingState):
     {fence}
     """
     alerts_res = llm.invoke(alerts_prompt)
-    workspace = Path(state["workspace_path"])
-    extract_and_write_artifacts(workspace, alerts_res.content)
+    extract_and_write_files(workspace, alerts_res.content)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     postmortem_prompt = f"""
@@ -306,97 +241,122 @@ def observability_and_postmortem_agent(state: SelfHealingState):
     docs_dir = workspace / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
     (docs_dir / "POSTMORTEM.md").write_text(pm_res.content, encoding="utf-8")
-    sys.stderr.write(f"Post-mortem saved to: {(docs_dir / 'POSTMORTEM.md').resolve()}\n")
-    
+    sys.stderr.write(f"[Phase 6] Post-mortem saved to: {(docs_dir / 'POSTMORTEM.md').resolve()}\n")
     return state
 
 
 # =====================================================================
-# 5. CONDITIONAL ROUTING & GRAPH COMPILATION
+# 4. GRAPH COMPILATION HELPER
 # =====================================================================
 
 def route_hotfix_verification(state: SelfHealingState):
     if state.get("last_test_exit_code", 1) == 0:
         return "verified"
     if state.get("iteration_count", 0) >= 3:
-        sys.stderr.write("Max self-healing repair attempts (3) reached. Proceeding to post-mortem.\n")
+        sys.stderr.write("[Phase 6] Max self-healing repair attempts (3) reached.\n")
         return "verified"
     return "retry_hotfix"
 
 
-workflow = StateGraph(SelfHealingState)
+def build_self_healing_graph(checkpointer=None):
+    workflow = StateGraph(SelfHealingState)
+    workflow.add_node("sre_triage", sre_triage_agent)
+    workflow.add_node("hotfix_engineer", hotfix_and_regression_engineer)
+    workflow.add_node("verifier", regression_verification_runner)
+    workflow.add_node("postmortem_writer", observability_and_postmortem_agent)
 
-workflow.add_node("sre_triage", sre_triage_agent)
-workflow.add_node("hotfix_engineer", hotfix_and_regression_engineer)
-workflow.add_node("verifier", regression_verification_runner)
-workflow.add_node("postmortem_writer", observability_and_postmortem_agent)
-
-workflow.add_edge(START, "sre_triage")
-workflow.add_edge("sre_triage", "hotfix_engineer")
-workflow.add_edge("hotfix_engineer", "verifier")
-
-workflow.add_conditional_edges(
-    "verifier",
-    route_hotfix_verification,
-    {
-        "verified": "postmortem_writer",
-        "retry_hotfix": "hotfix_engineer"
-    }
-)
-workflow.add_edge("postmortem_writer", END)
-
-self_healing_orchestrator = workflow.compile()
+    workflow.add_edge(START, "sre_triage")
+    workflow.add_edge("sre_triage", "hotfix_engineer")
+    workflow.add_edge("hotfix_engineer", "verifier")
+    workflow.add_conditional_edges(
+        "verifier",
+        route_hotfix_verification,
+        {"verified": "postmortem_writer", "retry_hotfix": "hotfix_engineer"},
+    )
+    workflow.add_edge("postmortem_writer", END)
+    return workflow.compile(checkpointer=checkpointer)
 
 
 # =====================================================================
-# 6. MCP TOOL REGISTRATION & SERVER ENTRY POINT
+# 5. MCP TOOL REGISTRATION
 # =====================================================================
 
 @mcp.tool()
-def heal_runtime_incident(
+async def heal_runtime_incident(
     incident_logs: str,
-    test_runner_command: str = "pytest -v",
-    workspace_path: str = "."
+    incident_id: str = "inc-auto",
+    test_runner_command: str = "",
+    workspace_path: str = ".",
 ) -> str:
     """
-    Executes Phase 6 of SDLC: Triages production stack traces or telemetry alerts, writes an 
-    automated regression test, patches the source code, verifies the fix against the test suite, 
-    adds Prometheus/OTel alert rules, and writes docs/POSTMORTEM.md.
-    
-    Args:
-        incident_logs: Raw stack trace, error log snippet, or monitoring alert payload.
-        test_runner_command: Command to run unit and regression tests (e.g., 'pytest -v').
-        workspace_path: Root repository directory.
+    Executes Phase 6 of SDLC inside an isolated Git worktree with SQLite checkpointing,
+    AST validation, scrubbed-environment pytest verification, Prometheus alerts, and POSTMORTEM.md.
     """
     root = Path(workspace_path).resolve()
-    arch_file = root / "docs" / "architecture.md"
+    thread_id = f"phase6-{incident_id.lower()}"
 
-    initial_state: SelfHealingState = {
-        "workspace_path": str(root),
-        "incident_logs": incident_logs.strip(),
-        "test_runner_command": test_runner_command,
-        "codebase_snapshot": read_codebase(root),
-        "arch_text": arch_file.read_text(encoding="utf-8") if arch_file.exists() else "",
-        "diagnosis": None,
-        "written_artifacts": [],
-        "pr_summary": "",
-        "last_test_stdout": "",
-        "last_test_stderr": "",
-        "last_test_exit_code": 1,
-        "iteration_count": 0
-    }
-    
-    final_state = self_healing_orchestrator.invoke(initial_state)
-    diag = final_state.get("diagnosis")
-    passed = final_state.get("last_test_exit_code", 1) == 0
-    
-    status = "RESOLVED & VERIFIED" if passed else "PATCHED (REQUIRES MANUAL REVIEW)"
-    return (
-        f"Phase 6 Self-Healing {status} for [{diag.severity if diag else 'INCIDENT'}] "
-        f"{diag.incident_title if diag else ''}. "
-        f"Alert rules updated under monitoring/ and post-mortem saved to {workspace_path}/docs/POSTMORTEM.md."
-    )
+    async with get_workspace_lock(root):
+        with git_worktree_sandbox(root, f"hotfix-{incident_id}") as sandbox_dir:
+            arch_file = sandbox_dir / "docs" / "architecture.md"
+            initial_state: SelfHealingState = {
+                "workspace_path": str(sandbox_dir),
+                "incident_logs": incident_logs.strip(),
+                "test_runner_command": test_runner_command.strip(),
+                "codebase_snapshot": get_source_snapshot(sandbox_dir),
+                "arch_text": arch_file.read_text(encoding="utf-8") if arch_file.exists() else "",
+                "diagnosis": None,
+                "written_artifacts": [],
+                "pr_summary": "",
+                "last_test_stdout": "",
+                "last_test_stderr": "",
+                "last_test_exit_code": 1,
+                "iteration_count": 0,
+            }
+
+            config = {"configurable": {"thread_id": thread_id}}
+            if AsyncSqliteSaver is not None:
+                os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
+                db_path = root / ".orchestrator" / "checkpoints.sqlite"
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                async with AsyncSqliteSaver.from_conn_string(str(db_path)) as saver:
+                    graph = build_self_healing_graph(checkpointer=saver)
+                    final_state = await graph.ainvoke(initial_state, config=config)
+            else:
+                graph = build_self_healing_graph(checkpointer=get_sqlite_checkpointer(root))
+                final_state = await asyncio.to_thread(graph.invoke, initial_state, config)
+
+            diag = final_state.get("diagnosis")
+            passed = final_state.get("last_test_exit_code", 1) == 0
+            iters = final_state.get("iteration_count", 0)
+            status = "RESOLVED_VERIFIED" if passed else "PATCHED_MANUAL_REVIEW"
+
+            log_audit_event(
+                workspace=root,
+                phase="phase6_self_healing",
+                thread_id=thread_id,
+                status=status,
+                iterations=iters,
+                details={
+                    "severity": diag.severity if diag else "UNKNOWN",
+                    "title": diag.incident_title if diag else "",
+                    "sandbox": str(sandbox_dir),
+                },
+            )
+
+            return (
+                f"Phase 6 Self-Healing {status} for [{diag.severity if diag else 'INCIDENT'}] "
+                f"{diag.incident_title if diag else ''}. "
+                f"Isolated worktree: {sandbox_dir} | Post-mortem: {sandbox_dir}/docs/POSTMORTEM.md"
+            )
 
 
 if __name__ == "__main__":
-    mcp.run()
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+    if transport == "http":
+        mcp.run(
+            transport="streamable-http",
+            host=os.getenv("MCP_HOST", "127.0.0.1"),
+            port=int(os.getenv("MCP_PORT", "8006")),
+        )
+    else:
+        mcp.run()

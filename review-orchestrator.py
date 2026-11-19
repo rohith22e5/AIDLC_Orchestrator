@@ -1,285 +1,223 @@
+import asyncio
 import os
+import shutil
+import subprocess
 import sys
+import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 from fastmcp import FastMCP
 
-# Switch between your preferred cloud model:
-from langchain_openai import ChatOpenAI
-# from langchain_anthropic import ChatAnthropic
-# from langchain_google_genai import ChatGoogleGenerativeAI
-
 from langgraph.graph import StateGraph, START, END
 
+try:
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+except ImportError:
+    AsyncSqliteSaver = None
+
+from orchestrator_core import (
+    TokenBudgetExceededError,
+    build_scrubbed_env,
+    extract_and_write_files,
+    get_llm,
+    get_source_snapshot,
+    get_sqlite_checkpointer,
+    get_workspace_lock,
+    log_audit_event,
+)
+
 # =====================================================================
-# 1. INITIALIZE FASTMCP SERVER & MODEL
+# 1. INITIALIZE FASTMCP SERVER
 # =====================================================================
 
-mcp = FastMCP("SDLC-Review-AppSec-Orchestrator")
-
-# High-reasoning model for static analysis & security auditing
-llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
-# llm = ChatAnthropic(model="claude-3-5-sonnet-latest", temperature=0.0)
-# llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.0)
+mcp = FastMCP("SDLC-AppSec-CodeReview-Orchestrator")
 
 
 # =====================================================================
-# 2. STRUCTURED SCHEMAS
+# 2. SCHEMAS & STATE
 # =====================================================================
 
-class SecurityQualityFinding(BaseModel):
-    severity: str = Field(description="'CRITICAL', 'HIGH', 'MEDIUM', or 'LOW'")
-    category: str = Field(description="'SECURITY', 'PERFORMANCE', 'ARCHITECTURE_DRIFT', or 'CODE_QUALITY'")
-    file_path: str = Field(description="Relative path to the affected file")
-    line_hint: str = Field(description="Function name or snippet where the issue occurs")
-    description: str = Field(description="Detailed explanation of the vulnerability or anti-pattern")
-    remediation_plan: str = Field(description="Exact code-level instructions to fix the issue")
+class SecurityAuditReport(BaseModel):
+    risk_level: str = Field(description="'LOW', 'MEDIUM', 'HIGH', or 'CRITICAL'")
+    approved_for_merge: bool = Field(description="True if no HIGH or CRITICAL issues exist")
+    findings: List[str] = Field(description="Specific security, concurrency, or code quality findings")
+    remediation_summary: str = Field(description="Concrete fixes required if not approved")
 
-class ReviewAuditPayload(BaseModel):
-    is_approved: bool = Field(
-        description="True ONLY if there are zero CRITICAL or HIGH severity findings."
-    )
-    findings: List[SecurityQualityFinding] = Field(default_factory=list)
-    audit_markdown: str = Field(
-        description="Complete, formatted SECURITY_AUDIT.md report summarizing findings, scores, and sign-off status"
-    )
-
-class FilePatch(BaseModel):
-    file_path: str = Field(description="Relative path to file being patched")
-    updated_content: str = Field(description="Complete updated file content with all fixes applied")
-
-class RemediationOutput(BaseModel):
-    patched_files: List[FilePatch]
-    changelog_summary: str
 
 class ReviewState(TypedDict):
     workspace_path: str
-    target_dir: str
-    arch_text: str
-    requirements_text: str
     codebase_snapshot: str
-    
-    audit_report: Optional[ReviewAuditPayload]
-    iteration_count: int
+    arch_text: str
+    static_scan_output: str
+    audit_report: Optional[SecurityAuditReport]
 
 
 # =====================================================================
-# 3. HELPER FUNCTIONS
+# 3. CONCURRENT DETERMINISTIC SCANNERS + LLM AUDITOR NODES
 # =====================================================================
 
-def collect_codebase(workspace: Path, target_subdir: str) -> str:
-    """Reads all source files in the target directory into a structured context string."""
-    search_root = workspace / target_subdir
-    if not search_root.exists():
-        search_root = workspace
-
-    ignore_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules", "docs", ".pytest_cache"}
-    allowed_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".sql"}
-    
-    snippets = []
-    for path in sorted(search_root.rglob("*")):
-        if any(part in ignore_dirs for part in path.parts):
-            continue
-        if path.is_file() and path.suffix in allowed_exts:
-            rel_path = path.relative_to(workspace).as_posix()
-            content = path.read_text(encoding="utf-8", errors="ignore")
-            snippets.append(f"### FILE: {rel_path}\n```\n{content}\n```")
-            
-    return "\n\n".join(snippets)
+def _run_single_scanner(tool: str, args: List[str], workspace: Path, env: dict) -> str:
+    exe = shutil.which(tool)
+    if not exe:
+        return f"[{tool.upper()}] not installed in PATH (skipped)"
+    try:
+        proc = subprocess.run([exe, *args], cwd=workspace, env=env, capture_output=True, text=True, timeout=30)
+        return f"[{tool.upper()} exit={proc.returncode}]\n{(proc.stdout or proc.stderr)[:1500]}"
+    except Exception as e:
+        return f"[{tool.upper()} error] {e}"
 
 
-# =====================================================================
-# 4. AGENT NODES
-# =====================================================================
-
-def appsec_and_quality_auditor(state: ReviewState):
-    sys.stderr.write("\n[Phase 3 -> Auditor] Scanning codebase for OWASP, secrets, performance & quality...\n")
-    
-    # Refresh codebase snapshot in case the remediation agent patched files
+async def static_security_scanner_node(state: ReviewState):
+    """Runs zero-token local linters & CVE/security scanners (ruff, bandit, pip-audit) concurrently."""
+    sys.stderr.write("\n[Phase 3 -> Step 1] Running concurrent static & security scanners...\n")
     workspace = Path(state["workspace_path"])
-    current_code = collect_codebase(workspace, state["target_dir"])
-    
-    if not current_code.strip():
-        sys.stderr.write("Warning: No source files found to audit.\n")
-        empty_report = ReviewAuditPayload(
-            is_approved=True,
-            findings=[],
-            audit_markdown="# Security & Quality Audit\n\nNo source files detected in target directory."
-        )
-        return {"audit_report": empty_report, "iteration_count": state.get("iteration_count", 0) + 1}
+    env = build_scrubbed_env(workspace)
+    scan_target = "src" if (workspace / "src").exists() else "."
+
+    scanners: List[Tuple[str, List[str]]] = [
+        ("ruff", ["check", scan_target]),
+        ("bandit", ["-r", scan_target, "-q"]),
+        ("pip-audit", ["--progress-spinner", "off"]),
+    ]
+    results = await asyncio.gather(
+        *(asyncio.to_thread(_run_single_scanner, tool, args, workspace, env) for tool, args in scanners)
+    )
+    return {"static_scan_output": "\n\n".join(results)}
+
+
+def appsec_and_quality_reviewer_agent(state: ReviewState):
+    sys.stderr.write("\n[Phase 3 -> Step 2] AppSec & Staff Reviewer auditing codebase...\n")
+    llm = get_llm()
+    workspace = Path(state["workspace_path"])
+    fence = "`" * 3
 
     prompt = f"""
-    You are a Staff Application Security (AppSec) Engineer and Principal Code Reviewer.
-    Audit the following implementation against the system architecture and requirements.
+    You are a Principal Application Security (AppSec) & Staff Code Reviewer.
+    Audit the source code below against the architecture contract and static scanner results.
 
-    [Architecture Specification]
-    {state['arch_text'][:3000]}
+    [Architecture Contract]
+    {state['arch_text'][:2500]}
 
-    [Requirements Specification]
-    {state['requirements_text'][:2000]}
+    [Deterministic Static Scanner Results]
+    {state['static_scan_output']}
 
-    [Source Codebase]
-    {current_code}
-
-    Audit Checklist:
-    1. SECURITY (OWASP Top 10): Check for SQL/Command injection, XSS, insecure deserialization, missing auth/RBAC checks, hardcoded API keys/secrets, and unsafe path traversals.
-    2. PERFORMANCE: Flag N+1 queries, unbounded loops, blocking I/O in async paths, or missing resource cleanup.
-    3. ARCHITECTURE ALIGNMENT: Verify code matches the contracts, data models, and error handling defined in `architecture.md`.
-    4. CODE QUALITY: Check for missing type hints, unhandled exceptions, dead code, and poor modularity.
-
-    Rules:
-    - Set `is_approved = False` if ANY 'CRITICAL' or 'HIGH' severity issues exist.
-    - Set `is_approved = True` if only 'MEDIUM' or 'LOW' recommendations remain.
-    - Generate a comprehensive `audit_markdown` report suitable for saving as `docs/SECURITY_AUDIT.md`.
-    """
-    
-    report = llm.with_structured_output(ReviewAuditPayload).invoke(prompt)
-    new_iter = state.get("iteration_count", 0) + 1
-    
-    sys.stderr.write(
-        f"Audit Pass #{new_iter}: {'APPROVED' if report.is_approved else 'REJECTED'} "
-        f"({len(report.findings)} findings)\n"
-    )
-    return {
-        "codebase_snapshot": current_code,
-        "audit_report": report,
-        "iteration_count": new_iter
-    }
-
-
-def code_remediation_engineer(state: ReviewState):
-    sys.stderr.write("\n[Phase 3 -> Remediator] Patching security and quality blockers...\n")
-    report = state["audit_report"]
-    
-    blockers = [f for f in report.findings if f.severity in ("CRITICAL", "HIGH")]
-    findings_text = "\n".join(
-        f"- [{f.severity}] ({f.category}) in `{f.file_path}` ({f.line_hint}): {f.description}\n  Fix: {f.remediation_plan}"
-        for f in blockers
-    )
-
-    prompt = f"""
-    You are a Senior Security & Refactoring Engineer.
-    The code review audit rejected the current implementation due to the following blockers:
-
-    {findings_text}
-
-    Current Codebase:
+    [Application Source Code]
     {state['codebase_snapshot']}
 
-    Task:
-    Rewrite the affected files to resolve every CRITICAL and HIGH severity finding cleanly 
-    without breaking existing functionality or public method signatures.
-    Return the full, complete file contents for every modified file.
+    Check specifically for:
+    1. Injection flaws, unsafe deserialization, path traversal, or hardcoded secrets
+    2. Thread-safety / race conditions / lock deadlocks
+    3. Unhandled edge-case inputs (`None`, negative numbers, type confusion)
+    4. Alignment with `docs/architecture.md`
     """
-    
-    remediation = llm.with_structured_output(RemediationOutput).invoke(prompt)
-    workspace = Path(state["workspace_path"])
-    
-    for patch in remediation.patched_files:
-        target = workspace / patch.file_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(patch.updated_content, encoding="utf-8")
-        sys.stderr.write(f"Patched file: {patch.file_path}\n")
-        
-    return state
+    report = llm.with_structured_output(SecurityAuditReport).invoke(prompt)
 
-
-def audit_report_writer(state: ReviewState):
-    sys.stderr.write("\n[Phase 3 -> Writer] Saving docs/SECURITY_AUDIT.md...\n")
-    docs_dir = Path(state["workspace_path"]) / "docs"
-    docs_dir.mkdir(parents=True, exist_ok=True)
-    
-    report_path = docs_dir / "SECURITY_AUDIT.md"
-    report_path.write_text(state["audit_report"].audit_markdown, encoding="utf-8")
-    sys.stderr.write(f"Audit report persisted to: {report_path.resolve()}\n")
-    return state
-
-
-# =====================================================================
-# 5. CONDITIONAL ROUTING & GRAPH COMPILATION
-# =====================================================================
-
-def route_after_review(state: ReviewState):
-    report = state.get("audit_report")
-    iterations = state.get("iteration_count", 0)
-    
-    if report and report.is_approved:
-        return "approved"
-    
-    if iterations >= 3:
-        sys.stderr.write(f"Max remediation cycles ({iterations}) reached. Writing final audit report.\n")
-        return "approved"
-        
-    return "remediate"
-
-
-workflow = StateGraph(ReviewState)
-
-workflow.add_node("auditor", appsec_and_quality_auditor)
-workflow.add_node("remediator", code_remediation_engineer)
-workflow.add_node("writer", audit_report_writer)
-
-workflow.add_edge(START, "auditor")
-workflow.add_conditional_edges(
-    "auditor",
-    route_after_review,
-    {
-        "approved": "writer",
-        "remediate": "remediator"
-    }
-)
-workflow.add_edge("remediator", "auditor")
-workflow.add_edge("writer", END)
-
-review_orchestrator = workflow.compile()
+    md_lines = [
+        "# Security & Code Review Report",
+        f"- **Risk Level:** {report.risk_level}",
+        f"- **Approved for Merge:** {report.approved_for_merge}",
+        "",
+        "## Static Scanner Output",
+        f"{fence}text\n{state['static_scan_output']}\n{fence}",
+        "",
+        "## Findings",
+        *(f"- {item}" for item in (report.findings or ["No blocking issues found."])),
+        "",
+        "## Remediation Summary",
+        report.remediation_summary,
+    ]
+    extract_and_write_files(
+        workspace,
+        f"FILE: docs/SECURITY_REVIEW.md\n{fence}markdown\n" + "\n".join(md_lines) + f"\n{fence}",
+    )
+    return {"audit_report": report}
 
 
 # =====================================================================
-# 6. MCP TOOL REGISTRATION & SERVER ENTRY POINT
+# 4. GRAPH COMPILATION HELPER
+# =====================================================================
+
+def build_review_graph(checkpointer=None):
+    workflow = StateGraph(ReviewState)
+    workflow.add_node("static_scanner", static_security_scanner_node)
+    workflow.add_node("appsec_reviewer", appsec_and_quality_reviewer_agent)
+
+    workflow.add_edge(START, "static_scanner")
+    workflow.add_edge("static_scanner", "appsec_reviewer")
+    workflow.add_edge("appsec_reviewer", END)
+    return workflow.compile(checkpointer=checkpointer)
+
+
+# =====================================================================
+# 5. MCP TOOL REGISTRATION
 # =====================================================================
 
 @mcp.tool()
-def review_and_harden_codebase(
-    target_dir: str = "src",
-    workspace_path: str = "."
+async def review_and_audit_codebase(
+    review_id: str = "",
+    workspace_path: str = ".",
 ) -> str:
     """
-    Executes Phase 3 of SDLC: Performs an AppSec (OWASP/Secrets), Performance, and Code Quality 
-    audit on the codebase, iteratively patches CRITICAL/HIGH findings, and generates docs/SECURITY_AUDIT.md.
-    
-    Args:
-        target_dir: Subdirectory containing source code to review (e.g., 'src' or '.').
-        workspace_path: Root repository directory.
+    Executes Phase 3 of SDLC: Runs local static/security scanners (ruff/bandit/pip-audit) concurrently
+    followed by AppSec & architectural code review, writing docs/SECURITY_REVIEW.md.
     """
-    root = Path(workspace_path)
-    docs_dir = root / "docs"
-    
-    arch_file = docs_dir / "architecture.md"
-    req_file = docs_dir / "requirements.md"
+    root = Path(workspace_path).resolve()
+    uid = review_id.strip() or uuid.uuid4().hex[:8]
+    thread_id = f"phase3-{uid}"
 
-    initial_state: ReviewState = {
-        "workspace_path": str(root.resolve()),
-        "target_dir": target_dir,
-        "arch_text": arch_file.read_text(encoding="utf-8") if arch_file.exists() else "",
-        "requirements_text": req_file.read_text(encoding="utf-8") if req_file.exists() else "",
-        "codebase_snapshot": "",
-        "audit_report": None,
-        "iteration_count": 0
-    }
-    
-    final_state = review_orchestrator.invoke(initial_state)
-    report = final_state.get("audit_report")
-    
-    status = "PASSED" if (report and report.is_approved) else "COMPLETED WITH WARNINGS"
-    finding_count = len(report.findings) if report else 0
-    
-    return (
-        f"Phase 3 Code Review & AppSec Audit {status} ({finding_count} total findings logged). "
-        f"Full report saved to {workspace_path}/docs/SECURITY_AUDIT.md."
-    )
+    async with get_workspace_lock(root):
+        arch_file = root / "docs" / "architecture.md"
+        initial_state: ReviewState = {
+            "workspace_path": str(root),
+            "codebase_snapshot": get_source_snapshot(root),
+            "arch_text": arch_file.read_text(encoding="utf-8") if arch_file.exists() else "",
+            "static_scan_output": "",
+            "audit_report": None,
+        }
+
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            if AsyncSqliteSaver is not None:
+                os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
+                db_path = root / ".orchestrator" / "checkpoints.sqlite"
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                async with AsyncSqliteSaver.from_conn_string(str(db_path)) as saver:
+                    graph = build_review_graph(checkpointer=saver)
+                    final_state = await graph.ainvoke(initial_state, config=config)
+            else:
+                graph = build_review_graph(checkpointer=get_sqlite_checkpointer(root))
+                final_state = await asyncio.to_thread(graph.invoke, initial_state, config)
+        except TokenBudgetExceededError as e:
+            log_audit_event(root, "phase3_review", thread_id, "TOKEN_BUDGET_HALTED", 1, {"error": str(e)})
+            return f"Phase 3 HALTED by token circuit breaker: {e}"
+
+        report = final_state.get("audit_report")
+        status = "APPROVED" if (report and report.approved_for_merge) else "CHANGES_REQUESTED"
+
+        log_audit_event(
+            workspace=root,
+            phase="phase3_review",
+            thread_id=thread_id,
+            status=status,
+            iterations=1,
+            details={"risk_level": report.risk_level if report else "UNKNOWN"},
+        )
+
+        return (
+            f"Phase 3 Review {status} (Risk: {report.risk_level if report else 'UNKNOWN'}). "
+            f"Full report saved to {root}/docs/SECURITY_REVIEW.md."
+        )
 
 
 if __name__ == "__main__":
-    mcp.run()
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+    if transport == "http":
+        mcp.run(
+            transport="streamable-http",
+            host=os.getenv("MCP_HOST", "127.0.0.1"),
+            port=int(os.getenv("MCP_PORT", "8003")),
+        )
+    else:
+        mcp.run()

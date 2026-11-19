@@ -1,284 +1,322 @@
+import asyncio
+import hashlib
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 from fastmcp import FastMCP
 
-# Model imports (choose your provider)
-from langchain_openai import ChatOpenAI
-# from langchain_anthropic import ChatAnthropic
-# from langchain_google_genai import ChatGoogleGenerativeAI
-
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command, interrupt
+
+try:
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+except ImportError:
+    AsyncSqliteSaver = None
+
+from orchestrator_core import (
+    TokenBudgetExceededError,
+    extract_and_write_files,
+    get_llm,
+    get_source_snapshot,
+    get_sqlite_checkpointer,
+    get_workspace_lock,
+    log_audit_event,
+)
 
 # =====================================================================
 # 1. INITIALIZE FASTMCP SERVER & MODEL
 # =====================================================================
 
-mcp = FastMCP("SDLC-Documentation-Orchestrator")
+mcp = FastMCP("SDLC-Requirements-Architecture-Orchestrator")
 
-# Select your cloud model
-llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
-# llm = ChatAnthropic(model="claude-3-5-sonnet-latest", temperature=0.1)
-# llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.1)
 
 # =====================================================================
-# 2. STRUCTURED SCHEMAS
+# 2. SCHEMAS & STATE
 # =====================================================================
 
-class RequirementItem(BaseModel):
-    id: str = Field(description="Unique ID e.g., FR-01, NFR-01")
-    title: str = Field(description="Short functional title")
-    description: str = Field(description="Detailed requirement description")
-    acceptance_summary: str = Field(description="Core condition of satisfaction")
+class AmbiguityCheck(BaseModel):
+    is_clear: bool = Field(description="True if requirements have enough detail to design architecture without guessing")
+    clarifying_questions: List[str] = Field(description="Up to 3 concise, high-impact questions if critical specs are missing")
 
-class RequirementsPayload(BaseModel):
-    functional_requirements: List[RequirementItem]
-    non_functional_requirements: List[RequirementItem]
-    markdown_content: str = Field(description="Full requirements.md document")
 
-class ArchitecturePayload(BaseModel):
-    tech_stack: List[str] = Field(description="Primary libraries, databases, and frameworks")
-    covered_fr_ids: List[str] = Field(description="List of FR IDs explicitly designed for")
-    mermaid_topology: str = Field(description="Mermaid.js diagram for architecture/flow")
-    mermaid_erd: str = Field(description="Mermaid.js diagram for database ERD")
-    markdown_content: str = Field(
-        description="Full architecture.md and spec.md document with embedded Mermaid code blocks"
+class SpecState(TypedDict):
+    workspace_path: str
+    product_prompt: str
+    human_clarifications: str
+    existing_codebase: str
+    requirements_md: str
+    architecture_md: str
+    plan_md: str
+
+
+# =====================================================================
+# 3. AGENT NODES (WITH HITL INTERRUPT GATE)
+# =====================================================================
+
+def clarify_requirements_node(state: SpecState):
+    """Checks for critical ambiguity before drafting specs; pauses via interrupt() if human input is needed."""
+    if state.get("human_clarifications"):
+        return {}
+
+    sys.stderr.write("\n[Phase 1 -> Gate] Checking product prompt for critical ambiguities...\n")
+    llm = get_llm()
+    check_prompt = f"""
+    You are a Principal Product Manager evaluating whether a feature request can be specified cleanly without guessing.
+
+    [Product Request]
+    {state['product_prompt']}
+
+    [Existing Codebase Context]
+    {state['existing_codebase'][:2000]}
+
+    Only mark `is_clear=False` if critical architectural choices (e.g., auth mechanism, persistence engine, eviction policy, API format)
+    are completely unspecified and cannot be inferred from the existing codebase. Ask at most 3 short, direct questions.
+    """
+    assessment = llm.with_structured_output(AmbiguityCheck).invoke(check_prompt)
+    if not assessment.is_clear and assessment.clarifying_questions:
+        sys.stderr.write(f"[Phase 1 -> HITL] Pausing for human clarification: {assessment.clarifying_questions}\n")
+        human_reply = interrupt({
+            "reason": "Clarification required before generating requirements",
+            "questions": assessment.clarifying_questions,
+        })
+        return {"human_clarifications": str(human_reply)}
+
+    return {}
+
+
+def product_manager_agent(state: SpecState):
+    sys.stderr.write("\n[Phase 1 -> Agent 1] Product Manager generating requirements & user stories...\n")
+    llm = get_llm()
+    fence = "`" * 3
+    clarification_block = (
+        f"\n[Human Clarifications]\n{state['human_clarifications']}\n"
+        if state.get("human_clarifications")
+        else ""
     )
 
-class UserStoryItem(BaseModel):
-    id: str = Field(description="Story ID e.g., US-01")
-    mapped_fr_id: str = Field(description="Traceability link to exact FR ID")
-    story: str = Field(description="As a... I want... So that...")
-    acceptance_criteria: List[str] = Field(description="Gherkin syntax (Given, When, Then)")
-
-class PlanPayload(BaseModel):
-    stories: List[UserStoryItem]
-    milestones: List[str] = Field(description="Milestone phases e.g., Phase 1 MVP, Phase 2")
-    mermaid_gantt: str = Field(description="Mermaid.js gantt or milestone flowchart")
-    markdown_content: str = Field(
-        description="Full plan.md and user_stories.md document with embedded Mermaid Gantt/Flow"
-    )
-
-class AuditFinding(BaseModel):
-    severity: str = Field(description="'BLOCKER' or 'INFO'")
-    target_agent: str = Field(description="'analyst', 'architect', or 'pm'")
-    issue: str
-    remediation: str
-
-class QualityAuditPayload(BaseModel):
-    is_approved: bool = Field(description="True if all traceability and quality checks pass")
-    findings: List[AuditFinding] = Field(default_factory=list)
-    actionable_critique: str = Field(
-        description="Concise instructions for the agents to remediate discrepancies"
-    )
-
-class DocGenState(TypedDict):
-    project_prompt: str
-    target_dir: str
-    requirements: Optional[RequirementsPayload]
-    architecture: Optional[ArchitecturePayload]
-    plan: Optional[PlanPayload]
-    audit: Optional[QualityAuditPayload]
-    iteration_count: int
-
-# =====================================================================
-# 3. AGENT NODES (Using stderr to avoid breaking MCP stdio)
-# =====================================================================
-
-def requirements_analyst(state: DocGenState):
-    sys.stderr.write("\n[Agent 1] Analyst generating requirements...\n")
-    critique_context = ""
-    if state.get("audit") and not state["audit"].is_approved:
-        critique_context = f"\nPREVIOUS AUDIT CRITIQUE TO RESOLVE:\n{state['audit'].actionable_critique}"
-
     prompt = f"""
-    You are a Principal Business Analyst and Requirements Engineer.
-    Project Brief:
-    "{state['project_prompt']}"
-    {critique_context}
+    You are a Principal Technical Product Manager.
+    Convert the product request below into a crisp, testable Product Requirements Document (`docs/requirements.md`).
 
-    Deconstruct this into an exhaustive, production-grade specification.
-    1. Extract Functional Requirements (FR-01, FR-02...) covering every user journey and edge case.
-    2. Extract Non-Functional Requirements (NFR-01...) for latency, security, scale, availability, and auth.
-    3. Generate the complete, professional Markdown document for `requirements.md`.
+    [Product Request]
+    {state['product_prompt']}
+    {clarification_block}
+    [Existing Codebase Context (if any)]
+    {state['existing_codebase'][:3000]}
+
+    Include:
+    1. Functional & Non-Functional Requirements
+    2. Prioritized User Stories (`US-01`, `US-02`, ...) with explicit Given/When/Then acceptance criteria
+    3. Edge Cases & Input Validation Contracts (exact exception types & error messages)
+
+    Output strictly using this Markdown format:
+
+    FILE: docs/requirements.md
+    {fence}markdown
+    # Product Requirements Document
+    ...
+    {fence}
     """
-    response = llm.with_structured_output(RequirementsPayload).invoke(prompt)
-    return {"requirements": response}
+    res = llm.invoke(prompt)
+    workspace = Path(state["workspace_path"])
+    extract_and_write_files(workspace, res.content)
+    req_file = workspace / "docs" / "requirements.md"
+    return {"requirements_md": req_file.read_text(encoding="utf-8") if req_file.exists() else res.content}
 
-def system_architect(state: DocGenState):
-    sys.stderr.write("[Agent 2] Architect designing topology & data models...\n")
-    reqs = state["requirements"]
-    critique_context = ""
-    if state.get("audit") and not state["audit"].is_approved:
-        critique_context = f"\nPREVIOUS AUDIT CRITIQUE TO RESOLVE:\n{state['audit'].actionable_critique}"
 
+def system_architect_agent(state: SpecState):
+    sys.stderr.write("\n[Phase 1 -> Agent 2] System Architect designing technical architecture...\n")
+    llm = get_llm()
+    fence = "`" * 3
     prompt = f"""
-    You are a Principal Enterprise Systems Architect.
-    Base Requirements:
-    {reqs.markdown_content}
-    {critique_context}
+    You are a Principal Software Architect.
+    Design a clean, modular technical architecture (`docs/architecture.md`) satisfying the requirements below.
 
-    Design the system architecture, component topology, and database models.
-    Mandatory:
-    1. Direct Traceability: Explicitly list all `covered_fr_ids` matching the requirements.
-    2. Visual Artifact 1 (System Topology): Valid `graph TD` or `sequenceDiagram` in Mermaid.js.
-    3. Visual Artifact 2 (Data Modeling): Valid `erDiagram` in Mermaid.js detailing tables/collections, keys, and relations.
-    4. Provide API endpoint contracts, schemas, and auth flow.
-    5. Generate the complete Markdown document for `architecture.md`. Embed both Mermaid diagrams inside ```mermaid code fences.
-    """
-    response = llm.with_structured_output(ArchitecturePayload).invoke(prompt)
-    return {"architecture": response}
-
-def project_manager(state: DocGenState):
-    sys.stderr.write("[Agent 3] Agile PM breaking down user stories & sprints...\n")
-    reqs = state["requirements"]
-    arch = state["architecture"]
-    critique_context = ""
-    if state.get("audit") and not state["audit"].is_approved:
-        critique_context = f"\nPREVIOUS AUDIT CRITIQUE TO RESOLVE:\n{state['audit'].actionable_critique}"
-
-    prompt = f"""
-    You are a Lead Agile Technical Program Manager.
-    Requirements:
-    {reqs.markdown_content}
-    Architecture:
-    {arch.markdown_content}
-    {critique_context}
-
-    Deconstruct into actionable sprints and user stories.
-    Mandatory:
-    1. Traceability: Every single User Story MUST explicitly reference its parent `mapped_fr_id`.
-    2. Acceptance Criteria: Every User Story must use Gherkin syntax (Given... When... Then...).
-    3. Visual Artifact: Valid Mermaid.js `gantt` chart or `graph LR` depicting delivery phases.
-    4. Generate the complete Markdown document for `plan.md`. Embed the Mermaid visualization inside ```mermaid code fences.
-    """
-    response = llm.with_structured_output(PlanPayload).invoke(prompt)
-    return {"plan": response}
-
-def quality_auditor(state: DocGenState):
-    sys.stderr.write("[Auditor] Evaluating quality gate & traceability...\n")
-    reqs = state["requirements"]
-    arch = state["architecture"]
-    plan = state["plan"]
-    
-    fr_ids = {r.id for r in reqs.functional_requirements}
-    arch_covered = set(arch.covered_fr_ids)
-    story_covered = {s.mapped_fr_id for s in plan.stories}
-
-    prompt = f"""
-    You are a Senior Technical Auditor.
-    Evaluate consistency and completeness:
-    - Defined FR IDs: {sorted(list(fr_ids))}
-    - Covered in Architecture: {sorted(list(arch_covered))}
-    - Covered in User Stories: {sorted(list(story_covered))}
-    
-    Full Documents:
     [Requirements]
-    {reqs.markdown_content}
-    [Architecture]
-    {arch.markdown_content}
-    [Plan]
-    {plan.markdown_content}
+    {state['requirements_md'][:4000]}
 
-    Validation Rules:
-    - Every FR ID must have corresponding architectural design and at least one user story.
-    - Mermaid syntax must be structurally valid and complete.
-    - If valid, approve (`is_approved = True`).
-    - If major gaps exist, reject (`is_approved = False`), assign findings, and provide actionable critique.
+    [Existing Codebase Context]
+    {state['existing_codebase'][:2500]}
+
+    Include:
+    1. Module & Directory Layout (`src/`, `tests/`)
+    2. Public Class/Function Signatures & Type Contracts
+    3. Concurrency, Thread-Safety (`threading.RLock`), and Error Handling Strategy
+    4. Mermaid Component/Sequence Diagram
+
+    Output strictly using this Markdown format:
+
+    FILE: docs/architecture.md
+    {fence}markdown
+    # System Architecture
+    ...
+    {fence}
     """
-    response = llm.with_structured_output(QualityAuditPayload).invoke(prompt)
-    new_iteration = state.get("iteration_count", 0) + 1
-    sys.stderr.write(f"Audit decision: {'APPROVED' if response.is_approved else 'REJECTED'}\n")
-    return {"audit": response, "iteration_count": new_iteration}
+    res = llm.invoke(prompt)
+    workspace = Path(state["workspace_path"])
+    extract_and_write_files(workspace, res.content)
+    arch_file = workspace / "docs" / "architecture.md"
+    return {"architecture_md": arch_file.read_text(encoding="utf-8") if arch_file.exists() else res.content}
 
-def file_writer(state: DocGenState):
-    out_dir = Path(state.get("target_dir", "./docs"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
-    (out_dir / "requirements.md").write_text(state["requirements"].markdown_content, encoding="utf-8")
-    (out_dir / "architecture.md").write_text(state["architecture"].markdown_content, encoding="utf-8")
-    (out_dir / "plan.md").write_text(state["plan"].markdown_content, encoding="utf-8")
-    
-    sys.stderr.write(f"Files written to {out_dir.resolve()}\n")
-    return state
 
-# =====================================================================
-# 4. GRAPH ASSEMBLY & CONDITIONAL ROUTING
-# =====================================================================
+def tech_lead_planner_agent(state: SpecState):
+    sys.stderr.write("\n[Phase 1 -> Agent 3] Tech Lead creating phased implementation plan...\n")
+    llm = get_llm()
+    fence = "`" * 3
+    prompt = f"""
+    You are a Staff Engineering Tech Lead.
+    Create a step-by-step TDD implementation plan (`docs/plan.md`) mapped directly to the user stories.
 
-def evaluate_audit_decision(state: DocGenState):
-    audit = state.get("audit")
-    iterations = state.get("iteration_count", 0)
-    
-    if audit and audit.is_approved:
-        return "approved"
-    if iterations >= 3:
-        sys.stderr.write(f"Max audit cycles reached ({iterations}). Proceeding to write files.\n")
-        return "approved"
-        
-    target_agents = {f.target_agent for f in audit.findings}
-    if "analyst" in target_agents:
-        return "retry_analyst"
-    elif "architect" in target_agents:
-        return "retry_architect"
-    return "retry_pm"
+    [Requirements]
+    {state['requirements_md'][:3000]}
 
-workflow = StateGraph(DocGenState)
+    [Architecture]
+    {state['architecture_md'][:3000]}
 
-workflow.add_node("analyst", requirements_analyst)
-workflow.add_node("architect", system_architect)
-workflow.add_node("pm", project_manager)
-workflow.add_node("auditor", quality_auditor)
-workflow.add_node("writer", file_writer)
+    Output strictly using this Markdown format:
 
-workflow.add_edge(START, "analyst")
-workflow.add_edge("analyst", "architect")
-workflow.add_edge("architect", "pm")
-workflow.add_edge("pm", "auditor")
+    FILE: docs/plan.md
+    {fence}markdown
+    # Implementation Plan
+    ...
+    {fence}
+    """
+    res = llm.invoke(prompt)
+    workspace = Path(state["workspace_path"])
+    extract_and_write_files(workspace, res.content)
+    plan_file = workspace / "docs" / "plan.md"
+    return {"plan_md": plan_file.read_text(encoding="utf-8") if plan_file.exists() else res.content}
 
-workflow.add_conditional_edges(
-    "auditor",
-    evaluate_audit_decision,
-    {
-        "approved": "writer",
-        "retry_analyst": "analyst",
-        "retry_architect": "architect",
-        "retry_pm": "pm",
-    }
-)
-workflow.add_edge("writer", END)
-
-orchestrator = workflow.compile()
 
 # =====================================================================
-# 5. MCP TOOL REGISTRATION & SERVER ENTRY POINT
+# 4. GRAPH COMPILATION HELPER
+# =====================================================================
+
+def build_spec_graph(checkpointer=None):
+    workflow = StateGraph(SpecState)
+    workflow.add_node("clarify_gate", clarify_requirements_node)
+    workflow.add_node("pm_agent", product_manager_agent)
+    workflow.add_node("architect_agent", system_architect_agent)
+    workflow.add_node("planner_agent", tech_lead_planner_agent)
+
+    workflow.add_edge(START, "clarify_gate")
+    workflow.add_edge("clarify_gate", "pm_agent")
+    workflow.add_edge("pm_agent", "architect_agent")
+    workflow.add_edge("architect_agent", "planner_agent")
+    workflow.add_edge("planner_agent", END)
+    return workflow.compile(checkpointer=checkpointer)
+
+
+# =====================================================================
+# 5. MCP TOOLS (START & RESUME)
 # =====================================================================
 
 @mcp.tool()
-def generate_project_specifications(project_brief: str, workspace_path: str = ".") -> str:
+async def generate_project_specs(
+    product_prompt: str,
+    skip_clarification: bool = False,
+    force_regenerate: bool = False,
+    workspace_path: str = ".",
+) -> str:
     """
-    Runs the multi-agent orchestration pipeline to generate production-grade 
-    requirements.md, architecture.md (with Mermaid diagrams), and plan.md (with Gherkin stories and Gantt).
-    
-    Args:
-        project_brief: Comprehensive overview of the project, features, user flows, and tech constraints.
-        workspace_path: Target root directory where the /docs folder will be saved.
+    Executes Phase 1 of SDLC: Generates docs/requirements.md, docs/architecture.md, and docs/plan.md.
+    If critical details are ambiguous (and skip_clarification=False), pauses and returns clarifying
+    questions with a thread_id so the user can answer via `resume_project_specs`.
     """
-    initial_state: DocGenState = {
-        "project_prompt": project_brief.strip(),
-        "target_dir": workspace_path,
-        "requirements": None,
-        "architecture": None,
-        "plan": None,
-        "audit": None,
-        "iteration_count": 0
-    }
-    
-    orchestrator.invoke(initial_state)
-    return f"Successfully generated requirements.md, architecture.md, and plan.md in {workspace_path}/docs"
+    root = Path(workspace_path).resolve()
+    prompt_hash = hashlib.sha256(product_prompt.strip().encode("utf-8")).hexdigest()[:12]
+    thread_id = f"phase1-{prompt_hash}"
+
+    async with get_workspace_lock(root):
+        cache_marker = root / ".orchestrator" / f"spec_{prompt_hash}.done"
+        req_exists = (root / "docs" / "requirements.md").exists()
+        arch_exists = (root / "docs" / "architecture.md").exists()
+        plan_exists = (root / "docs" / "plan.md").exists()
+
+        if not force_regenerate and cache_marker.exists() and req_exists and arch_exists and plan_exists:
+            log_audit_event(root, "phase1_specs", thread_id, "CACHE_HIT_SKIPPED", 0, {"hash": prompt_hash})
+            return f"Phase 1 Specs CACHE HIT (0 tokens spent) for hash [{prompt_hash}]."
+
+        initial_state: SpecState = {
+            "workspace_path": str(root),
+            "product_prompt": product_prompt.strip(),
+            "human_clarifications": "Proceed with sensible engineering defaults." if skip_clarification else "",
+            "existing_codebase": get_source_snapshot(root, max_chars=4000),
+            "requirements_md": "",
+            "architecture_md": "",
+            "plan_md": "",
+        }
+
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            if AsyncSqliteSaver is not None:
+                os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
+                db_path = root / ".orchestrator" / "checkpoints.sqlite"
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                async with AsyncSqliteSaver.from_conn_string(str(db_path)) as saver:
+                    graph = build_spec_graph(checkpointer=saver)
+                    result = await graph.ainvoke(initial_state, config=config)
+            else:
+                graph = build_spec_graph(checkpointer=get_sqlite_checkpointer(root))
+                result = await asyncio.to_thread(graph.invoke, initial_state, config)
+        except TokenBudgetExceededError as e:
+            log_audit_event(root, "phase1_specs", thread_id, "TOKEN_BUDGET_HALTED", 1, {"error": str(e)})
+            return f"Phase 1 HALTED by token circuit breaker: {e}"
+
+        if "__interrupt__" in result:
+            payload = result["__interrupt__"][0].value
+            questions = "\n".join(f"- {q}" for q in payload.get("questions", []))
+            log_audit_event(root, "phase1_specs", thread_id, "AWAITING_HUMAN_INPUT", 0, {"questions": payload.get("questions", [])})
+            return (
+                f"Phase 1 PAUSED for clarification (thread_id='{thread_id}'):\n{questions}\n\n"
+                f"Reply by calling `resume_project_specs(thread_id='{thread_id}', clarifications='...')`."
+            )
+
+        cache_marker.parent.mkdir(parents=True, exist_ok=True)
+        cache_marker.write_text(prompt_hash, encoding="utf-8")
+        log_audit_event(root, "phase1_specs", thread_id, "SPECS_GENERATED", 1, {"hash": prompt_hash})
+        return f"Phase 1 Specs GENERATED [{prompt_hash}]: Saved docs/requirements.md, docs/architecture.md, and docs/plan.md."
+
+
+@mcp.tool()
+async def resume_project_specs(
+    thread_id: str,
+    clarifications: str,
+    workspace_path: str = ".",
+) -> str:
+    """Resumes a paused Phase 1 specification workflow with the human's answers."""
+    root = Path(workspace_path).resolve()
+    config = {"configurable": {"thread_id": thread_id}}
+
+    async with get_workspace_lock(root):
+        try:
+            if AsyncSqliteSaver is not None:
+                os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
+                db_path = root / ".orchestrator" / "checkpoints.sqlite"
+                async with AsyncSqliteSaver.from_conn_string(str(db_path)) as saver:
+                    graph = build_spec_graph(checkpointer=saver)
+                    await graph.ainvoke(Command(resume=clarifications.strip()), config=config)
+            else:
+                graph = build_spec_graph(checkpointer=get_sqlite_checkpointer(root))
+                await asyncio.to_thread(graph.invoke, Command(resume=clarifications.strip()), config)
+        except TokenBudgetExceededError as e:
+            log_audit_event(root, "phase1_specs", thread_id, "TOKEN_BUDGET_HALTED", 1, {"error": str(e)})
+            return f"Phase 1 HALTED by token circuit breaker: {e}"
+
+        log_audit_event(root, "phase1_specs", thread_id, "SPECS_RESUMED_AND_GENERATED", 1)
+        return f"Phase 1 Specs RESUMED & GENERATED for [{thread_id}]: Saved docs/requirements.md, docs/architecture.md, and docs/plan.md."
+
 
 if __name__ == "__main__":
-    mcp.run()
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+    if transport == "http":
+        mcp.run(
+            transport="streamable-http",
+            host=os.getenv("MCP_HOST", "127.0.0.1"),
+            port=int(os.getenv("MCP_PORT", "8001")),
+        )
+    else:
+        mcp.run()
