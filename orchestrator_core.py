@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -52,8 +53,61 @@ def get_workspace_lock(workspace: Path) -> asyncio.Semaphore:
 
 
 # =====================================================================
-# 2. TOKEN-TRACKED LLM WRAPPER & FACTORY
+# 2. STAGE 3: ROLE-AWARE TIERED LLM ROUTER (CLOUD -> CLAUDE CLI -> OLLAMA)
 # =====================================================================
+
+AGENT_MODEL_MAP: Dict[str, str] = {
+    # Reasoning, Architecture, Security & SRE Triage -> Granite 4.2 8B
+    "clarify_gate": "granite4.2:8b",
+    "pm_agent": "granite4.2:8b",
+    "architect_agent": "granite4.2:8b",
+    "planner_agent": "granite4.2:8b",
+    "appsec_reviewer": "granite4.2:8b",
+    "sre_triage": "granite4.2:8b",
+    "observability_architect": "granite4.2:8b",
+    # Fast Code, Test & DevOps Generation -> Qwen 2.5 Coder 7B
+    "test_engineer": "qwen2.5-coder:7b",
+    "software_engineer": "qwen2.5-coder:7b",
+    "integration_architect": "qwen2.5-coder:7b",
+    "devops_engineer": "qwen2.5-coder:7b",
+    "hotfix_engineer": "qwen2.5-coder:7b",
+}
+
+ESCALATION_MODEL = "deepseek-coder-v2:latest"
+
+
+class ClaudeCLIRunnable:
+    """Optional Stage 3 adapter using logged-in `claude -p` subscription (never `--bare`)."""
+    def __init__(self, model: str = "sonnet", json_schema: Optional[dict] = None):
+        self.model = model
+        self.json_schema = json_schema
+
+    def invoke(self, prompt: Any, **kwargs: Any) -> Any:
+        cmd = ["claude", "-p", "--model", self.model, "--tools", "", "--output-format", "json"]
+        if self.json_schema:
+            cmd.extend(["--json-schema", json.dumps(self.json_schema)])
+        proc = subprocess.run(cmd, input=str(prompt), capture_output=True, text=True, timeout=180)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Claude CLI failed: {proc.stderr.strip()}")
+        data = json.loads(proc.stdout)
+        text = data.get("result", proc.stdout)
+        return type(
+            "LLMResponse",
+            (),
+            {"content": text, "usage_metadata": {"total_tokens": (len(str(prompt)) + len(text)) // 4}},
+        )()
+
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
+        json_schema = schema.model_json_schema() if hasattr(schema, "model_json_schema") else None
+        inner = ClaudeCLIRunnable(model=self.model, json_schema=json_schema)
+
+        class _StructuredCLI:
+            def invoke(self, p: Any, **kw: Any) -> Any:
+                raw = inner.invoke(p, **kw).content
+                return schema.model_validate_json(raw) if hasattr(schema, "model_validate_json") else json.loads(raw)
+
+        return _StructuredCLI()
+
 
 class TrackedStructuredRunnable:
     def __init__(self, runnable: Any, tracker: "TrackedLLM"):
@@ -63,7 +117,6 @@ class TrackedStructuredRunnable:
     def invoke(self, prompt: Any, **kwargs: Any) -> Any:
         self._tracker.check_budget()
         res = self._runnable.invoke(prompt, **kwargs)
-        # Estimate tokens for structured responses when metadata isn't exposed directly
         in_est = len(str(prompt)) // 4
         out_est = len(str(res)) // 4
         self._tracker.record_usage(in_est + out_est)
@@ -71,7 +124,7 @@ class TrackedStructuredRunnable:
 
 
 class TrackedLLM:
-    """Wraps any LangChain chat model to enforce per-thread token circuit breaking."""
+    """Wraps any LangChain/CLI model to enforce per-thread token circuit breaking."""
     def __init__(self, base_llm: Any, max_tokens: int = 50000):
         self._llm = base_llm
         self.max_tokens = max_tokens
@@ -102,28 +155,90 @@ class TrackedLLM:
         return TrackedStructuredRunnable(self._llm.with_structured_output(schema, **kwargs), self)
 
 
-def get_llm(model_name: Optional[str] = None, num_ctx: int = 4096, max_tokens: Optional[int] = None) -> TrackedLLM:
-    """Centralized local Ollama model factory wrapped with token budget tracking."""
-    selected = model_name or os.getenv("SDLC_OLLAMA_MODEL", "qwen2.5-coder:7b")
+def _claude_cli_available() -> bool:
+    """Checks if `claude` CLI is installed and SDLC_DISABLE_CLAUDE_CLI is not set."""
+    if os.getenv("SDLC_DISABLE_CLAUDE_CLI", "false").lower() == "true":
+        return False
+    return shutil.which("claude") is not None
+
+
+def get_llm(
+    agent_id: Optional[str] = None,
+    escalate: bool = False,
+    model_name: Optional[str] = None,
+    num_ctx: int = 4096,
+    max_tokens: Optional[int] = None,
+) -> TrackedLLM:
+    """
+    Automatic 3-Tier Waterfall Router:
+    1. Cloud API (if OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY is set & SDLC_PREFER_LOCAL!=true)
+    2. Claude Code CLI subscription (`claude -p`, if installed and authenticated)
+    3. Role-routed Local Ollama (`granite4.2:8b` / `qwen2.5-coder:7b` -> escalates to `deepseek-coder-v2:latest`)
+    """
     budget = max_tokens or int(os.getenv("SDLC_MAX_TOKENS_PER_RUN", "50000"))
+    prefer_local = os.getenv("SDLC_PREFER_LOCAL", "false").lower() == "true"
+
+    # --- TIER 1: Cloud APIs ---
+    if not prefer_local and not model_name:
+        if os.getenv("ANTHROPIC_API_KEY"):
+            from langchain_anthropic import ChatAnthropic
+            sys.stderr.write(f"[LLM Router] Agent [{agent_id}] -> Cloud Anthropic API\n")
+            return TrackedLLM(ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.0), max_tokens=budget)
+        if os.getenv("OPENAI_API_KEY"):
+            from langchain_openai import ChatOpenAI
+            sys.stderr.write(f"[LLM Router] Agent [{agent_id}] -> Cloud OpenAI API\n")
+            return TrackedLLM(ChatOpenAI(model="gpt-4o", temperature=0.0), max_tokens=budget)
+        if os.getenv("GEMINI_API_KEY"):
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            sys.stderr.write(f"[LLM Router] Agent [{agent_id}] -> Cloud Gemini API\n")
+            return TrackedLLM(ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.0), max_tokens=budget)
+
+    # --- TIER 2: Claude Code CLI Subscription (`claude -p`) ---
+    high_leverage_agents = {"architect_agent", "appsec_reviewer", "sre_triage"}
+    use_cli_for_node = (
+        escalate
+        or (agent_id in high_leverage_agents)
+        or (os.getenv("SDLC_CLAUDE_CLI_ALL", "false").lower() == "true")
+    )
+
+    if not prefer_local and not model_name and use_cli_for_node and _claude_cli_available():
+        sys.stderr.write(f"[LLM Router] Agent [{agent_id}] -> Claude Code CLI (`claude -p`)\n")
+        return TrackedLLM(ClaudeCLIRunnable(model="sonnet"), max_tokens=budget)
+
+    # --- TIER 3: Local Ollama Role-Aware Fallback ---
+    if model_name:
+        selected = model_name
+    elif escalate:
+        selected = os.getenv("SDLC_ESCALATION_MODEL", ESCALATION_MODEL)
+    elif agent_id and agent_id in AGENT_MODEL_MAP:
+        selected = AGENT_MODEL_MAP[agent_id]
+    else:
+        selected = os.getenv("SDLC_OLLAMA_MODEL", "qwen2.5-coder:7b")
+
+    sys.stderr.write(f"[LLM Router] Agent [{agent_id or 'default'}] -> Local Ollama ({selected})\n")
+    temp = 0.2 if "granite4.2" in selected else 0.0
     base = ChatOllama(
         model=selected,
-        temperature=0.0,
+        temperature=temp,
         num_ctx=num_ctx,
-        keep_alive="15m",
-        client_kwargs={"timeout": 120.0},
+        keep_alive="10m",
+        client_kwargs={"timeout": 180.0},
     )
     return TrackedLLM(base, max_tokens=budget)
 
 
 # =====================================================================
-# 3. PATH-SAFE MARKDOWN FILE EXTRACTION & AST GATES
+# 3. PATH-SAFE MARKDOWN FILE EXTRACTION, WRITE-LOCKS & AST GATES
 # =====================================================================
 
-def extract_and_write_files(workspace: Path, llm_text: str) -> List[ArtifactFile]:
+def extract_and_write_files(
+    workspace: Path,
+    llm_text: str,
+    allowed_prefixes: Optional[Tuple[str, ...]] = None,
+) -> List[ArtifactFile]:
     """
     Parses ```lang blocks preceded by 'FILE: path/to/file' and writes clean multi-line files.
-    Enforces strict path-traversal containment within `workspace`.
+    Enforces strict path-traversal containment and optional role-based directory write locks.
     """
     pattern = r"FILE:\s*([^\n`]+)\s*\n```[a-zA-Z0-9_-]*\n(.*?)```"
     matches = re.findall(pattern, llm_text, flags=re.DOTALL)
@@ -137,14 +252,19 @@ def extract_and_write_files(workspace: Path, llm_text: str) -> List[ArtifactFile
         if not target.is_relative_to(root):
             raise ValueError(f"Security violation: blocked path traversal attempt -> '{clean_path}'")
 
+        rel_posix = target.relative_to(root).as_posix()
+        if allowed_prefixes and not any(rel_posix == p.rstrip("/") or rel_posix.startswith(p) for p in allowed_prefixes):
+            sys.stderr.write(f"[Core] Write-Lock blocked unauthorized edit to '{rel_posix}' (allowed: {allowed_prefixes})\n")
+            continue
+
         target.parent.mkdir(parents=True, exist_ok=True)
         clean_code = code.strip() + "\n"
         target.write_text(clean_code, encoding="utf-8")
-        sys.stderr.write(f"[Core] Wrote file: {clean_path}\n")
-        written.append(ArtifactFile(file_path=clean_path, content=clean_code))
+        sys.stderr.write(f"[Core] Wrote file: {rel_posix}\n")
+        written.append(ArtifactFile(file_path=rel_posix, content=clean_code))
 
     if not written:
-        sys.stderr.write("[Core] Warning: No 'FILE: <path>' blocks matched in LLM response.\n")
+        sys.stderr.write("[Core] Warning: No permitted 'FILE: <path>' blocks matched in LLM response.\n")
     return written
 
 
@@ -256,14 +376,14 @@ def run_sandboxed_tests(
 
 
 # =====================================================================
-# 6. GIT WORKTREE ISOLATION
+# 6. GIT WORKTREE ISOLATION (WITH POWER-LOSS PRUNE GUARD)
 # =====================================================================
 
 @contextmanager
 def git_worktree_sandbox(repo_root: Path, branch_slug: str):
     """
     Creates an isolated git worktree under `.worktrees/<branch_slug>` if `repo_root` is a Git repo.
-    Falls back to `repo_root` directly if Git is not initialized yet.
+    Prunes stale worktree locks first so sudden power loss never blocks recovery.
     """
     root = repo_root.resolve()
     if not (root / ".git").exists():
@@ -276,6 +396,7 @@ def git_worktree_sandbox(repo_root: Path, branch_slug: str):
 
     if worktree_dir.exists():
         subprocess.run(["git", "worktree", "remove", "--force", str(worktree_dir)], cwd=root, capture_output=True)
+    subprocess.run(["git", "worktree", "prune"], cwd=root, capture_output=True)
 
     worktree_dir.parent.mkdir(parents=True, exist_ok=True)
     add_proc = subprocess.run(

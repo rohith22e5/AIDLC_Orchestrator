@@ -25,19 +25,12 @@ from orchestrator_core import (
     get_source_snapshot,
     get_sqlite_checkpointer,
     get_workspace_lock,
+    load_agent_prompt,
     log_audit_event,
 )
 
-# =====================================================================
-# 1. INITIALIZE FASTMCP SERVER
-# =====================================================================
-
 mcp = FastMCP("SDLC-AppSec-CodeReview-Orchestrator")
 
-
-# =====================================================================
-# 2. SCHEMAS & STATE
-# =====================================================================
 
 class SecurityAuditReport(BaseModel):
     risk_level: str = Field(description="'LOW', 'MEDIUM', 'HIGH', or 'CRITICAL'")
@@ -54,10 +47,6 @@ class ReviewState(TypedDict):
     audit_report: Optional[SecurityAuditReport]
 
 
-# =====================================================================
-# 3. CONCURRENT DETERMINISTIC SCANNERS + LLM AUDITOR NODES
-# =====================================================================
-
 def _run_single_scanner(tool: str, args: List[str], workspace: Path, env: dict) -> str:
     exe = shutil.which(tool)
     if not exe:
@@ -70,7 +59,6 @@ def _run_single_scanner(tool: str, args: List[str], workspace: Path, env: dict) 
 
 
 async def static_security_scanner_node(state: ReviewState):
-    """Runs zero-token local linters & CVE/security scanners (ruff, bandit, pip-audit) concurrently."""
     sys.stderr.write("\n[Phase 3 -> Step 1] Running concurrent static & security scanners...\n")
     workspace = Path(state["workspace_path"])
     env = build_scrubbed_env(workspace)
@@ -89,29 +77,22 @@ async def static_security_scanner_node(state: ReviewState):
 
 def appsec_and_quality_reviewer_agent(state: ReviewState):
     sys.stderr.write("\n[Phase 3 -> Step 2] AppSec & Staff Reviewer auditing codebase...\n")
-    llm = get_llm()
     workspace = Path(state["workspace_path"])
+    llm = get_llm()
+    system_spec = load_agent_prompt("appsec_reviewer", ["python_validation_contracts"], workspace=workspace)
     fence = "`" * 3
 
-    prompt = f"""
-    You are a Principal Application Security (AppSec) & Staff Code Reviewer.
-    Audit the source code below against the architecture contract and static scanner results.
+    prompt = f"""{system_spec}
 
-    [Architecture Contract]
-    {state['arch_text'][:2500]}
+[Architecture Contract]
+{state['arch_text'][:2500]}
 
-    [Deterministic Static Scanner Results]
-    {state['static_scan_output']}
+[Deterministic Static Scanner Results]
+{state['static_scan_output']}
 
-    [Application Source Code]
-    {state['codebase_snapshot']}
+[Application Source Code]
+{state['codebase_snapshot']}"""
 
-    Check specifically for:
-    1. Injection flaws, unsafe deserialization, path traversal, or hardcoded secrets
-    2. Thread-safety / race conditions / lock deadlocks
-    3. Unhandled edge-case inputs (`None`, negative numbers, type confusion)
-    4. Alignment with `docs/architecture.md`
-    """
     report = llm.with_structured_output(SecurityAuditReport).invoke(prompt)
 
     md_lines = [
@@ -135,10 +116,6 @@ def appsec_and_quality_reviewer_agent(state: ReviewState):
     return {"audit_report": report}
 
 
-# =====================================================================
-# 4. GRAPH COMPILATION HELPER
-# =====================================================================
-
 def build_review_graph(checkpointer=None):
     workflow = StateGraph(ReviewState)
     workflow.add_node("static_scanner", static_security_scanner_node)
@@ -150,19 +127,12 @@ def build_review_graph(checkpointer=None):
     return workflow.compile(checkpointer=checkpointer)
 
 
-# =====================================================================
-# 5. MCP TOOL REGISTRATION
-# =====================================================================
-
 @mcp.tool()
 async def review_and_audit_codebase(
     review_id: str = "",
     workspace_path: str = ".",
 ) -> str:
-    """
-    Executes Phase 3 of SDLC: Runs local static/security scanners (ruff/bandit/pip-audit) concurrently
-    followed by AppSec & architectural code review, writing docs/SECURITY_REVIEW.md.
-    """
+    """Executes Phase 3 of SDLC using dynamic agents.md & skills.md specs and concurrent CPU scanners."""
     root = Path(workspace_path).resolve()
     uid = review_id.strip() or uuid.uuid4().hex[:8]
     thread_id = f"phase3-{uid}"
@@ -184,11 +154,11 @@ async def review_and_audit_codebase(
                 db_path = root / ".orchestrator" / "checkpoints.sqlite"
                 db_path.parent.mkdir(parents=True, exist_ok=True)
                 async with AsyncSqliteSaver.from_conn_string(str(db_path)) as saver:
-                    graph = build_review_graph(checkpointer=saver)
-                    final_state = await graph.ainvoke(initial_state, config=config)
+                    final_state = await build_review_graph(checkpointer=saver).ainvoke(initial_state, config=config)
             else:
-                graph = build_review_graph(checkpointer=get_sqlite_checkpointer(root))
-                final_state = await asyncio.to_thread(graph.invoke, initial_state, config)
+                final_state = await asyncio.to_thread(
+                    build_review_graph(checkpointer=get_sqlite_checkpointer(root)).invoke, initial_state, config
+                )
         except TokenBudgetExceededError as e:
             log_audit_event(root, "phase3_review", thread_id, "TOKEN_BUDGET_HALTED", 1, {"error": str(e)})
             return f"Phase 3 HALTED by token circuit breaker: {e}"
@@ -196,28 +166,12 @@ async def review_and_audit_codebase(
         report = final_state.get("audit_report")
         status = "APPROVED" if (report and report.approved_for_merge) else "CHANGES_REQUESTED"
 
-        log_audit_event(
-            workspace=root,
-            phase="phase3_review",
-            thread_id=thread_id,
-            status=status,
-            iterations=1,
-            details={"risk_level": report.risk_level if report else "UNKNOWN"},
-        )
-
-        return (
-            f"Phase 3 Review {status} (Risk: {report.risk_level if report else 'UNKNOWN'}). "
-            f"Full report saved to {root}/docs/SECURITY_REVIEW.md."
-        )
+        log_audit_event(root, "phase3_review", thread_id, status, 1, {"risk_level": report.risk_level if report else "UNKNOWN"})
+        return f"Phase 3 Review {status} (Risk: {report.risk_level if report else 'UNKNOWN'}). Saved to {root}/docs/SECURITY_REVIEW.md."
 
 
 if __name__ == "__main__":
-    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
-    if transport == "http":
-        mcp.run(
-            transport="streamable-http",
-            host=os.getenv("MCP_HOST", "127.0.0.1"),
-            port=int(os.getenv("MCP_PORT", "8003")),
-        )
+    if os.getenv("MCP_TRANSPORT", "stdio").lower() == "http":
+        mcp.run(transport="streamable-http", host=os.getenv("MCP_HOST", "127.0.0.1"), port=int(os.getenv("MCP_PORT", "8003")))
     else:
         mcp.run()
